@@ -2,121 +2,467 @@ import { NextResponse } from "next/server";
 import { getData } from "pdf-parse/worker";
 import { PDFParse } from "pdf-parse";
 
+export const runtime = "nodejs";
+
 PDFParse.setWorker(getData());
 
-type Course = {
-  code: string;
+type Requirement = {
+  id: string;
+  area: string;
+  name: string;
+  choose: number;
+  options: string[];
+  rawText: string;
+};
+
+type InProgressCourse = {
+  courseCode: string;
   title: string;
   credits: number;
   term: string;
 };
 
-type RequiredCourse = {
-  display: string;
-  options: string[];
-};
+function cleanLine(value: string) {
+  return value
+    .replace(/\r/g, "")
+    .replace(/\u00ad/g, "")
+    .replace(/\uFFFE/g, "")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
 
-function getFirstMatch(text: string, pattern: RegExp): string {
-  const match = text.match(pattern);
-  return match?.[1]?.trim() ?? "";
+function normalizeCourseCode(value: string) {
+  const match = value
+    .toUpperCase()
+    .replace(/\./g, "")
+    .replace(/\s+/g, "")
+    .match(/^([A-Z]{2,6})(\d{3}[A-Z]{0,2})$/);
+
+  if (!match) {
+    return value.trim().toUpperCase();
+  }
+
+  return `${match[1]} ${match[2]}`;
 }
 
 function getSection(
   text: string,
-  startMarker: string,
-  endMarker: string
-): string {
-  const start = text.indexOf(startMarker);
+  startPattern: RegExp,
+  endPattern?: RegExp
+) {
+  const start = text.search(startPattern);
 
   if (start === -1) {
     return "";
   }
 
-  const end = text.indexOf(endMarker, start + startMarker.length);
+  const afterStart = text.slice(start);
+
+  if (!endPattern) {
+    return afterStart;
+  }
+
+  const end = afterStart.search(endPattern);
 
   if (end === -1) {
-    return text.slice(start);
+    return afterStart;
   }
 
-  return text.slice(start, end);
+  return afterStart.slice(0, end);
 }
 
-function extractInProgressCourses(text: string): Course[] {
-  const section = getSection(
-    text,
-    "In-progress Credits:",
-    "Legend"
+function isSectionBarrier(line: string) {
+  return (
+    !line ||
+    /^Course Title Grade Credits Term Repeated$/i.test(line) ||
+    /^Morgan State University/i.test(line) ||
+    /^-- \d+ of \d+ --$/i.test(line) ||
+    /^Unmet conditions/i.test(line) ||
+    /^In all instances/i.test(line) ||
+    /^Credits required:/i.test(line)
+  );
+}
+
+function looksLikeCourseRow(line: string) {
+  return /\b[A-Z]{2,6}\s+\d{3}[A-Z]{0,2}\b.*\b(?:TRA|TRB|TRC|TRD|A\+|A-|A|B\+|B-|B|C\+|C-|C|D\+|D-|D|P|S|IP)\b/i.test(
+    line
+  );
+}
+
+function extractLabelBeforeCourse(line: string) {
+  const match = line.match(
+    /\b[A-Z]{2,6}\s+\d{3}[A-Z]{0,2}\b/
   );
 
-  if (!section) {
-    return [];
+  if (!match || match.index === undefined) {
+    return "";
   }
 
-  const cleanedSection = section.replace(/\s+/g, " ");
-
-  const coursePattern =
-    /([A-Z]{2,5}\s+\d{3}[A-Z]?)\s+(.+?)\s+IP\s+\((\d+(?:\.\d+)?)\)\s+(FALL|SPRING|SUMMER|WINTER(?:\s+MINI-MESTER)?)\s+(\d{4})/g;
-
-  const matches = [...cleanedSection.matchAll(coursePattern)];
-
-  return matches.map((match) => ({
-    code: match[1].trim(),
-    title: match[2].trim(),
-    credits: Number(match[3]),
-    term: `${match[4]} ${match[5]}`,
-  }));
+  return line
+    .slice(0, match.index)
+    .trim();
 }
 
-function extractRequiredCourses(section: string): RequiredCourse[] {
+/*
+  IMPORTANT:
+  A continuation line may look like:
+
+  "or 119"
+
+  or:
+
+  "CHIN 102:499 or COMM 203"
+
+  It must NOT treat a normal sentence such as:
+
+  "Business Policy or Honors Still needed..."
+
+  as a continuation of the previous requirement.
+*/
+function isCourseOptionContinuation(line: string) {
+  const value = line.trim();
+
+  if (!value) {
+    return false;
+  }
+
+  if (/Still needed:/i.test(value)) {
+    return false;
+  }
+
+  if (/^or\b/i.test(value)) {
+    return true;
+  }
+
+  if (
+    /^[A-Z]{2,6}\s+\d{3}(?::\d{3})?\b/i.test(
+      value
+    )
+  ) {
+    return true;
+  }
+
+  if (/^\d{3}(?::\d{3})?\b/.test(value)) {
+    return true;
+  }
+
+  return false;
+}
+
+function parseCourseOptions(rawRequirement: string) {
+  const afterClass = rawRequirement.replace(
+    /^.*?\bClass(?:es)?\s+in\s+/i,
+    ""
+  );
+
+  const options: string[] = [];
+
+  let currentSubject = "";
+
+  const pattern =
+    /(?:\b([A-Z]{2,6})\s+)?(\d{3})(?::(\d{3}))?/g;
+
+  for (const match of afterClass.matchAll(pattern)) {
+    if (match[1]) {
+      currentSubject = match[1].toUpperCase();
+    }
+
+    if (!currentSubject) {
+      continue;
+    }
+
+    const lower = match[2];
+    const upper = match[3];
+
+    const option = upper
+      ? `${currentSubject} ${lower}:${upper}`
+      : `${currentSubject} ${lower}`;
+
+    if (!options.includes(option)) {
+      options.push(option);
+    }
+  }
+
+  return options;
+}
+
+function extractRequirements(
+  section: string,
+  area: string
+): Requirement[] {
   if (!section) {
     return [];
   }
 
-  const coursePattern =
-    /Still needed:\s*1 Class in\s+([A-Z]{2,5})\s+(\d{3}[A-Z]?)(?:\s+or\s+(\d{3}[A-Z]?))?/g;
+  const lines = section
+    .split("\n")
+    .map(cleanLine)
+    .filter(Boolean);
 
-  const matches = [...section.matchAll(coursePattern)];
+  const requirements: Requirement[] = [];
 
-  const results: RequiredCourse[] = [];
-  const seen = new Set<string>();
+  let currentRequirementLabel = "";
+  let pendingLabelParts: string[] = [];
+  let insideSatisfiedBy = false;
 
-  for (const match of matches) {
-    const subject = match[1];
-    const firstNumber = match[2];
-    const secondNumber = match[3];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
 
-    const options = [`${subject} ${firstNumber}`];
+    /*
+      A new Still-needed requirement always
+      exits a previous "Satisfied by" block.
+    */
+    const stillNeededIndex =
+      line.indexOf("Still needed:");
 
-    if (secondNumber) {
-      options.push(`${subject} ${secondNumber}`);
+    if (stillNeededIndex !== -1) {
+      insideSatisfiedBy = false;
+
+      const beforeStillNeeded = line
+        .slice(0, stillNeededIndex)
+        .trim();
+
+      let requirementText = line
+        .slice(
+          stillNeededIndex +
+            "Still needed:".length
+        )
+        .trim();
+
+      /*
+        We only want actual course requirements,
+        not lines such as:
+
+        "See Major section"
+        "120 credits are required"
+      */
+      if (
+        !/\d+\s+Class(?:es)?\s+in\s+/i.test(
+          requirementText
+        )
+      ) {
+        pendingLabelParts = [];
+        continue;
+      }
+
+      let next = i + 1;
+
+      while (
+        next < lines.length &&
+        isCourseOptionContinuation(lines[next])
+      ) {
+        requirementText += ` ${lines[next]}`;
+        next++;
+      }
+
+      i = next - 1;
+
+      let name = beforeStillNeeded;
+
+      if (!name && pendingLabelParts.length > 0) {
+        name = pendingLabelParts
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+
+      if (!name && currentRequirementLabel) {
+        name = currentRequirementLabel;
+      }
+
+      if (!name) {
+        name = "Remaining Requirement";
+      }
+
+      const chooseMatch =
+        requirementText.match(
+          /(\d+)\s+Class(?:es)?\s+in/i
+        );
+
+      const choose = chooseMatch
+        ? Number(chooseMatch[1])
+        : 1;
+
+      const options =
+        parseCourseOptions(requirementText);
+
+      if (options.length > 0) {
+        requirements.push({
+          id: `${area
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")}-${requirements.length + 1}`,
+
+          area,
+
+          name,
+
+          choose,
+
+          options,
+
+          rawText: requirementText,
+        });
+      }
+
+      pendingLabelParts = [];
+
+      continue;
     }
 
-    const display = options.join(" / ");
+    if (/^Satisfied by:/i.test(line)) {
+      insideSatisfiedBy = true;
+      continue;
+    }
 
-    if (!seen.has(display)) {
-      seen.add(display);
+    /*
+      Ignore transfer-source description
+      lines after "Satisfied by:".
+    */
+    if (insideSatisfiedBy) {
+      if (looksLikeCourseRow(line)) {
+        insideSatisfiedBy = false;
+      } else {
+        continue;
+      }
+    }
 
-      results.push({
-        display,
-        options,
-      });
+    if (looksLikeCourseRow(line)) {
+      const label =
+        extractLabelBeforeCourse(line);
+
+      if (label) {
+        currentRequirementLabel = label;
+      }
+
+      pendingLabelParts = [];
+      continue;
+    }
+
+    if (isSectionBarrier(line)) {
+      pendingLabelParts = [];
+      continue;
+    }
+
+    /*
+      Ignore section titles themselves.
+    */
+    if (
+      /^(University Requirements|General Education Program|Major .* INCOMPLETE|Business and Management Support and Core)/i.test(
+        line
+      )
+    ) {
+      pendingLabelParts = [];
+      continue;
+    }
+
+    /*
+      These are useful for multiline labels such as:
+
+      Activity, Adulting, Financial Literacy, Mindfulness,
+      or Discovering Student Identity
+    */
+    if (
+      !/^Satisfied by/i.test(line) &&
+      !/^Please note/i.test(line)
+    ) {
+      pendingLabelParts.push(line);
+
+      if (pendingLabelParts.length > 4) {
+        pendingLabelParts.shift();
+      }
     }
   }
 
-  return results;
+  return requirements;
+}
+
+function extractCompletedCourses(text: string) {
+  const flat = text
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ");
+
+  const completed =
+    new Set<string>();
+
+  const pattern =
+    /\b([A-Z]{2,6})\s+(\d{3}[A-Z]{0,2})\b.{0,180}?\b(TRA|TRB|TRC|TRD|A\+|A-|A|B\+|B-|B|C\+|C-|C|D\+|D-|D|P|S)\b\s+(\d+(?:\.\d+)?)\s+(FALL|SPRING|SUMMER|WINTER(?:\s+MINI-MESTER)?)\s+(\d{4})/g;
+
+  for (const match of flat.matchAll(pattern)) {
+    completed.add(
+      normalizeCourseCode(
+        `${match[1]} ${match[2]}`
+      )
+    );
+  }
+
+  return [...completed].sort();
+}
+
+function extractInProgressCourses(
+  text: string
+): InProgressCourse[] {
+  const flat = text
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ");
+
+  const courses =
+    new Map<string, InProgressCourse>();
+
+  const pattern =
+    /\b([A-Z]{2,6})\s+(\d{3}[A-Z]{0,2})\s+(.{1,100}?)\s+IP\s+\((\d+(?:\.\d+)?)\)\s+(FALL|SPRING|SUMMER|WINTER(?:\s+MINI-MESTER)?)\s+(\d{4})/g;
+
+  for (const match of flat.matchAll(pattern)) {
+    const courseCode =
+      normalizeCourseCode(
+        `${match[1]} ${match[2]}`
+      );
+
+    if (courses.has(courseCode)) {
+      continue;
+    }
+
+    courses.set(courseCode, {
+      courseCode,
+
+      title: match[3]
+        .replace(/\s+/g, " ")
+        .trim(),
+
+      credits: Number(match[4]),
+
+      term: `${match[5]} ${match[6]}`,
+    });
+  }
+
+  return [...courses.values()];
+}
+
+function extractRemainingCredits(section: string) {
+  const match = section.match(
+    /you still need\s+(\d+(?:\.\d+)?)\s+more credits/i
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  return Number(match[1]);
 }
 
 export async function POST(request: Request) {
   let parser: PDFParse | null = null;
 
   try {
-    const formData = await request.formData();
+    const formData =
+      await request.formData();
+
     const file = formData.get("file");
 
     if (!(file instanceof File)) {
       return NextResponse.json(
         {
-          error: "No PDF file was uploaded.",
+          error:
+            "Please upload a DegreeWorks PDF.",
         },
         {
           status: 400,
@@ -124,129 +470,173 @@ export async function POST(request: Request) {
       );
     }
 
-    if (file.type !== "application/pdf") {
-      return NextResponse.json(
-        {
-          error: "The uploaded file must be a PDF.",
-        },
-        {
-          status: 400,
-        }
-      );
-    }
+    const arrayBuffer =
+      await file.arrayBuffer();
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const buffer =
+      Buffer.from(arrayBuffer);
 
     parser = new PDFParse({
       data: buffer,
     });
 
-    const parsedPDF = await parser.getText();
-    const text = parsedPDF.text;
+    const parsed =
+      await parser.getText();
 
-    if (!text || text.trim().length === 0) {
-      return NextResponse.json(
-        {
-          error:
-            "No readable text was found in this PDF.",
-        },
-        {
-          status: 400,
-        }
-      );
-    }
+    const rawText = parsed.text
+      .replace(/\r/g, "")
+      .replace(/\u00ad/g, "")
+      .replace(/\uFFFE/g, "")
+      .replace(/[ \t]+/g, " ")
+      .trim();
 
-    const degree = getFirstMatch(
-      text,
-      /Degree\s+([^\n]+)/
-    );
+    const flatText = rawText
+      .replace(/\n/g, " ")
+      .replace(/\s+/g, " ");
 
-    const major = getFirstMatch(
-      text,
-      /\bMajor\s+(.+?)\s+Program\b/
-    );
-
-    const progress = getFirstMatch(
-      text,
-      /Degree progress\s+(\d+)%/
-    );
-
-    const requirementsProgress = getFirstMatch(
-      text,
-      /Requirements\s+(\d+)%/
-    );
-
-    const gpa = getFirstMatch(
-      text,
-      /Overall GPA\s+([\d.]+)/
-    );
-
-    const catalogYear = getFirstMatch(
-      text,
-      /Catalog year:\s*([A-Z]+\s+\d{4})/
-    );
-
-    const creditsSummary = text.match(
-      /Credits required:\s*(\d+)\s+Credits applied:\s*(\d+)/
-    );
-
-    const creditsRequired = creditsSummary
-      ? Number(creditsSummary[1])
-      : 0;
-
-    const creditsApplied = creditsSummary
-      ? Number(creditsSummary[2])
-      : 0;
-
-    const creditsRemainingMatch = text.match(
-      /You still need\s+(\d+)\s+more\s+credits/
-    );
-
-    const creditsRemaining = creditsRemainingMatch
-      ? Number(creditsRemainingMatch[1])
-      : Math.max(creditsRequired - creditsApplied, 0);
-
-    const generalEducationSection = getSection(
-      text,
-      "General Education Program INCOMPLETE",
-      "Major Cybersecurity Intelligence Management"
-    );
-
-    const generalEducationRemainingMatch =
-      generalEducationSection.match(
-        /you still need\s+(\d+)\s+more credits/i
+    const universitySection =
+      getSection(
+        rawText,
+        /University Requirements INCOMPLETE/i,
+        /General Education Program INCOMPLETE/i
       );
 
-    const generalEducationCreditsRemaining =
-      generalEducationRemainingMatch
-        ? Number(generalEducationRemainingMatch[1])
-        : 0;
+    const generalEducationSection =
+      getSection(
+        rawText,
+        /General Education Program INCOMPLETE/i,
+        /Major .+? INCOMPLETE/i
+      );
 
-    const majorSection = getSection(
-      text,
-      "Major Cybersecurity Intelligence Management INCOMPLETE",
-      "Business and Management Support and Core"
-    );
+    const majorSection =
+      getSection(
+        rawText,
+        /Major .+? INCOMPLETE/i,
+        /Business and Management Support and Core INCOMPLETE/i
+      );
 
-    const businessSection = getSection(
-      text,
-      "Business and Management Support and Core INCOMPLETE",
-      "Free Electives"
-    );
+    const businessSection =
+      getSection(
+        rawText,
+        /Business and Management Support and Core INCOMPLETE/i,
+        /Free Electives/i
+      );
 
-    const remainingMajorCourses =
-      extractRequiredCourses(majorSection);
+    const universityRequirements =
+      extractRequirements(
+        universitySection,
+        "University Requirements"
+      );
 
-    const remainingBusinessCourses =
-      extractRequiredCourses(businessSection);
+    const generalEducationRequirements =
+      extractRequirements(
+        generalEducationSection,
+        "General Education"
+      );
 
-    const inProgressCourses =
-      extractInProgressCourses(text);
+    const majorRequirements =
+      extractRequirements(
+        majorSection,
+        "Major"
+      );
 
-    const inProgressCredits =
-      inProgressCourses.reduce(
-        (total, course) => total + course.credits,
+    const businessRequirements =
+      extractRequirements(
+        businessSection,
+        "Business/Core"
+      );
+
+    const requirements = [
+      ...universityRequirements,
+      ...generalEducationRequirements,
+      ...majorRequirements,
+      ...businessRequirements,
+    ];
+
+    const degree =
+      flatText.match(
+        /Degree\s+(.+?)\s+Audit date/i
+      )?.[1]?.trim() ?? "";
+
+    const major =
+      flatText.match(
+        /Major\s+(.+?)\s+Program\s+/i
+      )?.[1]?.trim() ?? "";
+
+    const catalogYear =
+      flatText.match(
+        /Catalog year:\s*([A-Z]+\s+\d{4})/i
+      )?.[1]?.trim() ?? "";
+
+    const degreeProgress =
+      Number(
+        flatText.match(
+          /Degree progress\s+(\d+)%/i
+        )?.[1] ?? 0
+      );
+
+    const requirementsProgress =
+      Number(
+        flatText.match(
+          /Requirements\s+(\d+)%/i
+        )?.[1] ?? 0
+      );
+
+    const gpa =
+      flatText.match(
+        /Overall GPA\s+([\d.]+)/i
+      )?.[1] ?? "0.000";
+
+    const creditsMatch =
+      flatText.match(
+        /Credits required:\s*(\d+)\s+Credits applied:\s*(\d+)/i
+      );
+
+    const creditsRequired =
+      Number(
+        creditsMatch?.[1] ?? 0
+      );
+
+    const creditsApplied =
+      Number(
+        creditsMatch?.[2] ?? 0
+      );
+
+    const minimumCreditsTo120 =
+      Math.max(
+        0,
+        creditsRequired -
+          creditsApplied
+      );
+
+    const knownRemainingCredits = [
+      extractRemainingCredits(
+        generalEducationSection
+      ),
+      extractRemainingCredits(
+        majorSection
+      ),
+      extractRemainingCredits(
+        businessSection
+      ),
+    ]
+      .filter(
+        (
+          value
+        ): value is number =>
+          value !== null
+      )
+      .reduce(
+        (total, value) =>
+          total + value,
+        0
+      );
+
+    const outstandingCourseCount =
+      requirements.reduce(
+        (total, requirement) =>
+          total +
+          requirement.choose,
         0
       );
 
@@ -260,35 +650,62 @@ export async function POST(request: Request) {
       },
 
       academicSummary: {
-        degreeProgress: Number(progress || 0),
-        requirementsProgress: Number(
-          requirementsProgress || 0
-        ),
+        degreeProgress,
+        requirementsProgress,
         gpa,
+
         creditsRequired,
         creditsApplied,
-        creditsRemaining,
-        generalEducationCreditsRemaining,
+
+        minimumCreditsTo120,
+
+        outstandingCourseCount,
+
+        /*
+          This comes from the explicit
+          remaining-credit totals in
+          Gen Ed + Major + Business/Core.
+
+          The separate University
+          requirement has variable credit
+          options, so the UI will display
+          this as "51+" rather than
+          pretending it is exact.
+        */
+        knownRemainingRequirementCredits:
+          knownRemainingCredits,
+
+        hasVariableCreditRequirement:
+          universityRequirements.length >
+          0,
       },
 
-      inProgress: {
-        credits: inProgressCredits,
-        courses: inProgressCourses,
-      },
+      completedCourses:
+        extractCompletedCourses(
+          rawText
+        ),
 
-      remainingRequirements: {
-        majorCourses: remainingMajorCourses,
-        businessCourses: remainingBusinessCourses,
-      },
+      inProgress:
+        extractInProgressCourses(
+          rawText
+        ),
 
-      rawText: text,
+      requirements,
+
+      rawText,
     });
   } catch (error) {
-    console.error("Degree audit parsing error:", error);
+    console.error(
+      "DegreeWorks parsing error:",
+      error
+    );
 
     return NextResponse.json(
       {
-        error: "StudentDash could not analyze this DegreeWorks PDF.",
+        success: false,
+
+        error:
+          "StudentDash could not analyze this DegreeWorks PDF.",
       },
       {
         status: 500,

@@ -2,16 +2,20 @@
 
 import { useState } from "react";
 
-type Course = {
-  code: string;
+type Requirement = {
+  id: string;
+  area: string;
+  name: string;
+  choose: number;
+  options: string[];
+  rawText: string;
+};
+
+type InProgressCourse = {
+  courseCode: string;
   title: string;
   credits: number;
   term: string;
-};
-
-type RequiredCourse = {
-  display: string;
-  options: string[];
 };
 
 type AuditResult = {
@@ -27,109 +31,299 @@ type AuditResult = {
     degreeProgress: number;
     requirementsProgress: number;
     gpa: string;
+
     creditsRequired: number;
     creditsApplied: number;
-    creditsRemaining: number;
-    generalEducationCreditsRemaining: number;
+
+    minimumCreditsTo120: number;
+
+    outstandingCourseCount: number;
+
+    knownRemainingRequirementCredits: number;
+
+    hasVariableCreditRequirement: boolean;
   };
 
-  inProgress: {
-    credits: number;
-    courses: Course[];
-  };
+  completedCourses: string[];
 
-  remainingRequirements: {
-    majorCourses: RequiredCourse[];
-    businessCourses: RequiredCourse[];
-  };
+  inProgress: InProgressCourse[];
+
+  requirements: Requirement[];
 
   rawText: string;
 };
 
-export default function DegreePlanner() {
-  const [file, setFile] = useState<File | null>(null);
-  const [result, setResult] =
-    useState<AuditResult | null>(null);
+type PlannedCourse = {
+  id: string;
 
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
+  courseCode: string | null;
+
+  title: string;
+
+  credits: number;
+
+  creditsEstimated: boolean;
+
+  prerequisiteOnly: boolean;
+
+  choiceRequirement: boolean;
+
+  choiceOptions: string[];
+
+  verification:
+    | "verified"
+    | "tentative"
+    | "choice";
+
+  warning: string | null;
+};
+
+type Semester = {
+  name: string;
+
+  term: string;
+
+  year: number;
+
+  creditLimit: number;
+
+  credits: number;
+
+  courses: PlannedCourse[];
+};
+
+type PlanResult = {
+  success: boolean;
+
+  summary: {
+    degreeRequirementCount: number;
+
+    plannedCredits: number;
+
+    plannedCreditsIncludeEstimates: boolean;
+
+    addedPrerequisites: number;
+
+    tentativeCourses: number;
+
+    choiceRequirements: number;
+  };
+
+  semesters: Semester[];
+
+  unplaced: {
+    courseCode: string | null;
+    title: string;
+    reason: string;
+  }[];
+};
+
+function compactOptions(
+  options: string[]
+) {
+  return options.join(", ");
+}
+
+export default function DegreePlannerPage() {
+  const [file, setFile] =
+    useState<File | null>(
+      null
+    );
+
+  const [audit, setAudit] =
+    useState<AuditResult | null>(
+      null
+    );
+
+  const [plan, setPlan] =
+    useState<PlanResult | null>(
+      null
+    );
+
+  const [
+    analyzing,
+    setAnalyzing,
+  ] = useState(false);
+
+  const [
+    buildingPlan,
+    setBuildingPlan,
+  ] = useState(false);
+
+  const [error, setError] =
+    useState("");
+
+  const [
+    maxCredits,
+    setMaxCredits,
+  ] = useState(15);
+
+  const [
+    includeSummer,
+    setIncludeSummer,
+  ] = useState(true);
+
+  const [
+    includeWinter,
+    setIncludeWinter,
+  ] = useState(false);
 
   function handleFileChange(
     event: React.ChangeEvent<HTMLInputElement>
   ) {
-    const selectedFile = event.target.files?.[0];
+    const selected =
+      event.target.files?.[0];
 
-    setResult(null);
     setError("");
+    setAudit(null);
+    setPlan(null);
 
-    if (!selectedFile) {
+    if (!selected) {
       setFile(null);
       return;
     }
 
-    if (selectedFile.type !== "application/pdf") {
+    if (
+      selected.type !==
+      "application/pdf"
+    ) {
       setFile(null);
-      setError("Please select a PDF file.");
+
+      setError(
+        "Please upload a PDF file."
+      );
+
       return;
     }
 
-    setFile(selectedFile);
+    setFile(selected);
   }
 
-  async function analyzeDegreeAudit() {
+  async function analyzeDegree() {
     if (!file) {
       return;
     }
 
-    setLoading(true);
+    setAnalyzing(true);
     setError("");
-    setResult(null);
-
-    const formData = new FormData();
-    formData.append("file", file);
+    setAudit(null);
+    setPlan(null);
 
     try {
-      const response = await fetch(
-        "/api/analyze-degree",
-        {
-          method: "POST",
-          body: formData,
-        }
+      const formData =
+        new FormData();
+
+      formData.append(
+        "file",
+        file
       );
 
-      const data = await response.json();
+      const response =
+        await fetch(
+          "/api/analyze-degree",
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
+
+      const data =
+        await response.json();
 
       if (!response.ok) {
         setError(
           data.error ||
-            "StudentDash could not analyze this PDF."
+            "DegreeWorks analysis failed."
         );
 
         return;
       }
 
-      setResult(data);
+      setAudit(data);
     } catch (error) {
       console.error(error);
 
       setError(
-        "Something went wrong while analyzing the PDF."
+        "StudentDash could not analyze the PDF."
       );
     } finally {
-      setLoading(false);
+      setAnalyzing(false);
+    }
+  }
+
+  async function buildPlan() {
+    if (!audit) {
+      return;
+    }
+
+    setBuildingPlan(true);
+    setPlan(null);
+    setError("");
+
+    try {
+      const response =
+        await fetch(
+          "/api/build-degree-plan",
+          {
+            method: "POST",
+
+            headers: {
+              "Content-Type":
+                "application/json",
+            },
+
+            body: JSON.stringify({
+              requirements:
+                audit.requirements,
+
+              completedCourses:
+                audit.completedCourses,
+
+              inProgress:
+                audit.inProgress,
+
+              maxCredits,
+
+              includeSummer,
+
+              includeWinter,
+            }),
+          }
+        );
+
+      const data =
+        await response.json();
+
+      if (!response.ok) {
+        setError(
+          data.error ||
+            "StudentDash could not build the degree plan."
+        );
+
+        return;
+      }
+
+      setPlan(data);
+    } catch (error) {
+      console.error(error);
+
+      setError(
+        "Something went wrong while building the degree plan."
+      );
+    } finally {
+      setBuildingPlan(false);
     }
   }
 
   function resetPlanner() {
     setFile(null);
-    setResult(null);
+    setAudit(null);
+    setPlan(null);
     setError("");
   }
 
   return (
     <main className="min-h-screen bg-gray-50 text-gray-900">
-      {/* Header */}
-
       <nav className="border-b bg-white">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
           <a
@@ -146,400 +340,612 @@ export default function DegreePlanner() {
       </nav>
 
       <div className="mx-auto max-w-7xl px-6 py-12">
-        {/* Page heading */}
-
         <div className="max-w-3xl">
           <p className="font-semibold text-gray-500">
-            Degree Planning
+            DegreeWorks Planner
           </p>
 
-          <h1 className="mt-2 text-4xl font-bold tracking-tight">
-            Understand your degree progress.
+          <h1 className="mt-2 text-4xl font-bold">
+            Build your path to graduation.
           </h1>
 
           <p className="mt-4 text-lg leading-8 text-gray-600">
-            Upload your DegreeWorks audit and
-            StudentDash will organize your academic
-            progress, current courses, and remaining
-            requirements.
+            Upload your DegreeWorks
+            audit. StudentDash reads
+            your remaining course
+            requirements, checks
+            prerequisites, and builds a
+            semester plan.
           </p>
         </div>
 
-        {/* Upload */}
-
-        <section className="mt-10 rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
-          <div>
-            <h2 className="text-xl font-semibold">
-              Upload DegreeWorks Audit
-            </h2>
-
-            <p className="mt-2 text-sm text-gray-500">
-              Upload the PDF version of your latest
-              degree audit.
-            </p>
-          </div>
+        <section className="mt-10 rounded-2xl border bg-white p-8 shadow-sm">
+          <h2 className="text-xl font-bold">
+            Upload DegreeWorks
+          </h2>
 
           <input
             type="file"
             accept=".pdf,application/pdf"
             onChange={handleFileChange}
-            className="mt-6 block w-full rounded-xl border border-gray-300 bg-gray-50 p-4 text-sm"
+            className="mt-5 block w-full rounded-xl border bg-gray-50 p-4"
           />
 
           {file && (
-            <div className="mt-5 rounded-xl bg-gray-50 p-4">
-              <p className="text-sm font-semibold">
-                Selected file
-              </p>
-
-              <p className="mt-1 text-sm text-gray-600">
+            <div className="mt-4 rounded-xl bg-gray-50 p-4">
+              <p className="font-medium">
                 {file.name}
               </p>
 
-              <p className="mt-1 text-xs text-gray-500">
-                {(file.size / 1024 / 1024).toFixed(2)} MB
-              </p>
-            </div>
-          )}
-
-          {error && (
-            <div className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4">
-              <p className="text-sm font-medium text-red-700">
-                {error}
+              <p className="mt-1 text-sm text-gray-500">
+                {(
+                  file.size /
+                  1024 /
+                  1024
+                ).toFixed(2)}{" "}
+                MB
               </p>
             </div>
           )}
 
           <div className="mt-6 flex flex-wrap gap-3">
             <button
-              onClick={analyzeDegreeAudit}
-              disabled={!file || loading}
-              className="rounded-xl bg-black px-6 py-3 font-medium text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
+              onClick={
+                analyzeDegree
+              }
+              disabled={
+                !file ||
+                analyzing
+              }
+              className="rounded-xl bg-black px-6 py-3 font-medium text-white disabled:bg-gray-300"
             >
-              {loading
-                ? "Analyzing Degree Audit..."
+              {analyzing
+                ? "Reading DegreeWorks..."
                 : "Analyze Degree Audit"}
             </button>
 
-            {(file || result) && (
+            {(file ||
+              audit ||
+              plan) && (
               <button
-                onClick={resetPlanner}
-                className="rounded-xl border border-gray-300 px-6 py-3 font-medium transition hover:bg-gray-50"
+                onClick={
+                  resetPlanner
+                }
+                className="rounded-xl border px-6 py-3 font-medium"
               >
                 Reset
               </button>
             )}
           </div>
+
+          {error && (
+            <div className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+              {error}
+            </div>
+          )}
         </section>
 
-        {/* Results */}
-
-        {result && (
-          <div className="mt-10 space-y-8">
-            {/* Degree information */}
-
-            <section className="rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
+        {audit && (
+          <>
+            <section className="mt-8 rounded-2xl border bg-white p-8 shadow-sm">
               <p className="text-sm font-semibold uppercase tracking-wide text-gray-500">
-                Degree
+                Degree Audit
               </p>
 
               <h2 className="mt-2 text-3xl font-bold">
-                {result.student.major ||
-                  "Major not detected"}
+                {
+                  audit.student
+                    .major
+                }
               </h2>
 
-              <div className="mt-3 flex flex-wrap gap-x-6 gap-y-2 text-sm text-gray-600">
-                <span>
-                  {result.student.degree ||
-                    "Degree unavailable"}
-                </span>
+              <p className="mt-2 text-gray-600">
+                {
+                  audit.student
+                    .degree
+                }
 
-                {result.student.catalogYear && (
-                  <span>
-                    Catalog:{" "}
-                    {result.student.catalogYear}
-                  </span>
+                {audit.student
+                  .catalogYear &&
+                  ` • ${audit.student.catalogYear}`}
+              </p>
+
+              <div className="mt-8 grid gap-4 md:grid-cols-4">
+                <div className="rounded-xl bg-gray-50 p-5">
+                  <p className="text-sm text-gray-500">
+                    Degree Progress
+                  </p>
+
+                  <p className="mt-2 text-3xl font-bold">
+                    {
+                      audit
+                        .academicSummary
+                        .degreeProgress
+                    }
+                    %
+                  </p>
+                </div>
+
+                <div className="rounded-xl bg-gray-50 p-5">
+                  <p className="text-sm text-gray-500">
+                    GPA
+                  </p>
+
+                  <p className="mt-2 text-3xl font-bold">
+                    {
+                      audit
+                        .academicSummary
+                        .gpa
+                    }
+                  </p>
+                </div>
+
+                <div className="rounded-xl bg-black p-5 text-white">
+                  <p className="text-sm text-gray-300">
+                    Remaining Courses
+                  </p>
+
+                  <p className="mt-2 text-3xl font-bold">
+                    {
+                      audit
+                        .academicSummary
+                        .outstandingCourseCount
+                    }
+                  </p>
+
+                  <p className="mt-2 text-xs text-gray-300">
+                    course requirements
+                  </p>
+                </div>
+
+                <div className="rounded-xl bg-gray-50 p-5">
+                  <p className="text-sm text-gray-500">
+                    Requirement Credits
+                  </p>
+
+                  <p className="mt-2 text-3xl font-bold">
+                    {
+                      audit
+                        .academicSummary
+                        .knownRemainingRequirementCredits
+                    }
+                    {audit
+                      .academicSummary
+                      .hasVariableCreditRequirement
+                      ? "+"
+                      : ""}
+                  </p>
+
+                  <p className="mt-2 text-xs text-gray-500">
+                    {audit
+                      .academicSummary
+                      .hasVariableCreditRequirement
+                      ? "Plus the University Requirement course"
+                      : "Remaining requirement credits"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5 rounded-xl bg-blue-50 p-4 text-sm text-blue-900">
+                Your audit also shows{" "}
+                <strong>
+                  {
+                    audit
+                      .academicSummary
+                      .minimumCreditsTo120
+                  }
+                </strong>{" "}
+                minimum credits to reach
+                120 total credits. That
+                number is separate from
+                your actual remaining
+                degree requirements.
+              </div>
+            </section>
+
+            <section className="mt-8 rounded-2xl border bg-white p-8 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-2xl font-bold">
+                    Remaining Requirements
+                  </h2>
+
+                  <p className="mt-2 text-gray-600">
+                    StudentDash found{" "}
+                    {
+                      audit
+                        .academicSummary
+                        .outstandingCourseCount
+                    }{" "}
+                    remaining course
+                    requirements.
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-6 space-y-4">
+                {audit.requirements.map(
+                  (
+                    requirement
+                  ) => (
+                    <div
+                      key={
+                        requirement.id
+                      }
+                      className="rounded-xl border p-5"
+                    >
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="rounded-full bg-gray-100 px-3 py-1 text-xs font-semibold">
+                          {
+                            requirement.area
+                          }
+                        </span>
+
+                        <p className="font-bold">
+                          {
+                            requirement.name
+                          }
+                        </p>
+                      </div>
+
+                      {requirement.options
+                        .length ===
+                      1 ? (
+                        <p className="mt-3 text-sm font-semibold">
+                          {
+                            requirement
+                              .options[0]
+                          }
+                        </p>
+                      ) : (
+                        <details className="mt-3">
+                          <summary className="cursor-pointer text-sm font-semibold">
+                            Choose{" "}
+                            {
+                              requirement.choose
+                            }{" "}
+                            from{" "}
+                            {
+                              requirement
+                                .options
+                                .length
+                            }{" "}
+                            approved options
+                          </summary>
+
+                          <p className="mt-3 rounded-lg bg-gray-50 p-4 text-sm leading-6 text-gray-600">
+                            {compactOptions(
+                              requirement.options
+                            )}
+                          </p>
+                        </details>
+                      )}
+                    </div>
+                  )
                 )}
               </div>
             </section>
 
-            {/* Summary cards */}
+            {audit.inProgress.length >
+              0 && (
+              <section className="mt-8 rounded-2xl border bg-white p-8 shadow-sm">
+                <h2 className="text-xl font-bold">
+                  Current Semester
+                </h2>
 
-            <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-              <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
-                <p className="text-sm text-gray-500">
-                  Degree Progress
-                </p>
-
-                <p className="mt-2 text-3xl font-bold">
-                  {
-                    result.academicSummary
-                      .degreeProgress
-                  }
-                  %
-                </p>
-
-                <div className="mt-4 h-2 overflow-hidden rounded-full bg-gray-200">
-                  <div
-                    className="h-full rounded-full bg-black"
-                    style={{
-                      width: `${Math.min(
-                        result.academicSummary
-                          .degreeProgress,
-                        100
-                      )}%`,
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
-                <p className="text-sm text-gray-500">
-                  GPA
-                </p>
-
-                <p className="mt-2 text-3xl font-bold">
-                  {result.academicSummary.gpa ||
-                    "—"}
-                </p>
-              </div>
-
-              <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
-                <p className="text-sm text-gray-500">
-                  Credits Applied
-                </p>
-
-                <p className="mt-2 text-3xl font-bold">
-                  {
-                    result.academicSummary
-                      .creditsApplied
-                  }
-                  <span className="text-lg font-normal text-gray-400">
-                    {" "}
-                    /{" "}
-                    {
-                      result.academicSummary
-                        .creditsRequired
-                    }
-                  </span>
-                </p>
-              </div>
-
-              <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
-                <p className="text-sm text-gray-500">
-                  Credits Remaining
-                </p>
-
-                <p className="mt-2 text-3xl font-bold">
-                  {
-                    result.academicSummary
-                      .creditsRemaining
-                  }
-                </p>
-              </div>
-            </section>
-
-            {/* Current courses */}
-
-            <section className="rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div>
-                  <p className="text-sm font-semibold uppercase tracking-wide text-gray-500">
-                    Current Semester
-                  </p>
-
-                  <h2 className="mt-1 text-2xl font-bold">
-                    In-Progress Courses
-                  </h2>
-                </div>
-
-                <div className="rounded-full bg-gray-100 px-4 py-2 text-sm font-medium">
-                  {result.inProgress.credits} credits
-                </div>
-              </div>
-
-              {result.inProgress.courses.length >
-              0 ? (
-                <div className="mt-6 divide-y">
-                  {result.inProgress.courses.map(
+                <div className="mt-5 grid gap-3 md:grid-cols-2">
+                  {audit.inProgress.map(
                     (course) => (
                       <div
-                        key={`${course.code}-${course.term}`}
-                        className="flex flex-col justify-between gap-2 py-4 sm:flex-row sm:items-center"
+                        key={
+                          course.courseCode
+                        }
+                        className="rounded-xl bg-gray-50 p-4"
                       >
-                        <div>
-                          <p className="font-semibold">
-                            {course.code}
-                          </p>
+                        <p className="font-bold">
+                          {
+                            course.courseCode
+                          }
+                        </p>
 
-                          <p className="mt-1 text-sm text-gray-500">
-                            {course.title}
-                          </p>
-                        </div>
-
-                        <div className="text-sm text-gray-500 sm:text-right">
-                          <p>
-                            {course.credits} credits
-                          </p>
-
-                          <p>{course.term}</p>
-                        </div>
+                        <p className="mt-1 text-sm text-gray-600">
+                          {
+                            course.title
+                          }
+                        </p>
                       </div>
                     )
                   )}
                 </div>
-              ) : (
-                <p className="mt-6 text-gray-500">
-                  No in-progress courses were detected.
-                </p>
-              )}
+              </section>
+            )}
+
+            <section className="mt-8 rounded-2xl border bg-white p-8 shadow-sm">
+              <h2 className="text-2xl font-bold">
+                Build My Degree Plan
+              </h2>
+
+              <p className="mt-2 text-gray-600">
+                Choose how you want
+                StudentDash to spread
+                your remaining courses.
+              </p>
+
+              <div className="mt-6 flex flex-wrap items-end gap-4">
+                <div>
+                  <label className="block text-sm font-semibold">
+                    Fall / Spring maximum
+                  </label>
+
+                  <select
+                    value={
+                      maxCredits
+                    }
+                    onChange={(
+                      event
+                    ) =>
+                      setMaxCredits(
+                        Number(
+                          event
+                            .target
+                            .value
+                        )
+                      )
+                    }
+                    className="mt-2 rounded-xl border px-4 py-3"
+                  >
+                    <option value={12}>
+                      12 credits
+                    </option>
+
+                    <option value={15}>
+                      15 credits
+                    </option>
+
+                    <option value={18}>
+                      18 credits
+                    </option>
+                  </select>
+                </div>
+
+                <label className="flex items-center gap-3 rounded-xl border px-4 py-3">
+                  <input
+                    type="checkbox"
+                    checked={
+                      includeSummer
+                    }
+                    onChange={(
+                      event
+                    ) =>
+                      setIncludeSummer(
+                        event.target
+                          .checked
+                      )
+                    }
+                  />
+
+                  <span className="font-medium">
+                    Include Summer
+                  </span>
+                </label>
+
+                <label className="flex items-center gap-3 rounded-xl border px-4 py-3">
+                  <input
+                    type="checkbox"
+                    checked={
+                      includeWinter
+                    }
+                    onChange={(
+                      event
+                    ) =>
+                      setIncludeWinter(
+                        event.target
+                          .checked
+                      )
+                    }
+                  />
+
+                  <span className="font-medium">
+                    Include Winter
+                  </span>
+                </label>
+
+                <button
+                  onClick={
+                    buildPlan
+                  }
+                  disabled={
+                    buildingPlan
+                  }
+                  className="rounded-xl bg-black px-7 py-3 font-semibold text-white disabled:bg-gray-300"
+                >
+                  {buildingPlan
+                    ? "Building plan..."
+                    : "Build My Degree Plan"}
+                </button>
+              </div>
+
+              <p className="mt-4 text-sm text-gray-500">
+                Summer and Winter are
+                automatically limited to
+                a maximum of 6 credits.
+              </p>
             </section>
+          </>
+        )}
 
-            {/* Remaining requirements */}
+        {plan && (
+          <div className="mt-10 space-y-7">
+            <div>
+              <p className="text-sm font-semibold uppercase tracking-wide text-gray-500">
+                Degree Plan
+              </p>
 
-            <div className="grid gap-8 lg:grid-cols-2">
-              {/* Major */}
+              <h2 className="mt-2 text-3xl font-bold">
+                Recommended Schedule
+              </h2>
 
-              <section className="rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
-                <p className="text-sm font-semibold uppercase tracking-wide text-gray-500">
-                  Major Requirements
-                </p>
-
-                <h2 className="mt-1 text-2xl font-bold">
-                  Remaining Major Courses
-                </h2>
-
-                {result.remainingRequirements
-                  .majorCourses.length > 0 ? (
-                  <div className="mt-6 space-y-3">
-                    {result.remainingRequirements.majorCourses.map(
-                      (course) => (
-                        <div
-                          key={course.display}
-                          className="flex items-center justify-between rounded-xl bg-gray-50 px-4 py-4"
-                        >
-                          <span className="font-semibold">
-                            {course.display}
-                          </span>
-
-                          <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-gray-500">
-                            Required
-                          </span>
-                        </div>
-                      )
-                    )}
-                  </div>
-                ) : (
-                  <p className="mt-6 text-gray-500">
-                    No remaining major courses were
-                    detected.
-                  </p>
-                )}
-              </section>
-
-              {/* Business */}
-
-              <section className="rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
-                <p className="text-sm font-semibold uppercase tracking-wide text-gray-500">
-                  Supporting Requirements
-                </p>
-
-                <h2 className="mt-1 text-2xl font-bold">
-                  Business & Core Courses
-                </h2>
-
-                {result.remainingRequirements
-                  .businessCourses.length > 0 ? (
-                  <div className="mt-6 space-y-3">
-                    {result.remainingRequirements.businessCourses.map(
-                      (course) => (
-                        <div
-                          key={course.display}
-                          className="flex items-center justify-between rounded-xl bg-gray-50 px-4 py-4"
-                        >
-                          <span className="font-semibold">
-                            {course.display}
-                          </span>
-
-                          <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-gray-500">
-                            Required
-                          </span>
-                        </div>
-                      )
-                    )}
-                  </div>
-                ) : (
-                  <p className="mt-6 text-gray-500">
-                    No remaining business/core courses
-                    were detected.
-                  </p>
-                )}
-              </section>
+              <p className="mt-2 text-gray-600">
+                {
+                  plan.summary
+                    .degreeRequirementCount
+                }{" "}
+                degree requirements
+                {plan.summary
+                  .addedPrerequisites >
+                  0 &&
+                  ` + ${plan.summary.addedPrerequisites} added prerequisite${
+                    plan.summary
+                      .addedPrerequisites ===
+                    1
+                      ? ""
+                      : "s"
+                  }`}
+              </p>
             </div>
 
-            {/* Other requirements */}
+            {plan.semesters.map(
+              (semester) => (
+                <section
+                  key={
+                    semester.name
+                  }
+                  className="rounded-2xl border bg-white p-7 shadow-sm"
+                >
+                  <div className="flex items-center justify-between gap-4">
+                    <h3 className="text-2xl font-bold">
+                      {
+                        semester.name
+                      }
+                    </h3>
 
-            <section className="rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
-              <p className="text-sm font-semibold uppercase tracking-wide text-gray-500">
-                General Education
-              </p>
+                    <span className="rounded-full bg-gray-100 px-4 py-2 text-sm font-semibold">
+                      {
+                        semester.credits
+                      }{" "}
+                      /{" "}
+                      {
+                        semester.creditLimit
+                      }{" "}
+                      credits
+                    </span>
+                  </div>
 
-              <h2 className="mt-1 text-2xl font-bold">
-                Other Outstanding Requirements
-              </h2>
+                  <div className="mt-5 divide-y">
+                    {semester.courses.map(
+                      (course) => (
+                        <div
+                          key={
+                            course.id
+                          }
+                          className="flex flex-col justify-between gap-3 py-4 sm:flex-row sm:items-center"
+                        >
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="font-bold">
+                                {course.courseCode ??
+                                  course.title}
+                              </p>
 
-              <div className="mt-6 rounded-xl bg-gray-50 p-5">
-                <p className="font-semibold">
-                  General Education
-                </p>
+                              {course.prerequisiteOnly && (
+                                <span className="rounded-full bg-purple-100 px-2 py-1 text-xs font-semibold text-purple-800">
+                                  Added
+                                  prerequisite
+                                </span>
+                              )}
 
-                <p className="mt-2 text-sm text-gray-600">
-                  DegreeWorks reports{" "}
-                  <strong>
-                    {
-                      result.academicSummary
-                        .generalEducationCreditsRemaining
-                    }{" "}
-                    credits
-                  </strong>{" "}
-                  still remaining in this area.
-                </p>
-              </div>
-            </section>
+                              {course.verification ===
+                                "tentative" && (
+                                <span className="rounded-full bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-800">
+                                  ⚠ Verify
+                                  prereq
+                                </span>
+                              )}
 
-            {/* Planner notice */}
+                              {course.choiceRequirement && (
+                                <span className="rounded-full bg-blue-100 px-2 py-1 text-xs font-semibold text-blue-800">
+                                  Choose 1
+                                </span>
+                              )}
+                            </div>
 
-            <section className="rounded-2xl border border-gray-300 bg-white p-8">
-              <h2 className="text-xl font-bold">
-                Next: Smart Semester Planning
-              </h2>
+                            {course.courseCode && (
+                              <p className="mt-1 text-sm text-gray-600">
+                                {
+                                  course.title
+                                }
+                              </p>
+                            )}
 
-              <p className="mt-3 leading-7 text-gray-600">
-                StudentDash has identified what your
-                degree audit says you still need. It
-                has not yet determined which courses
-                you are eligible to take next.
-              </p>
+                            {course.choiceRequirement && (
+                              <details className="mt-2">
+                                <summary className="cursor-pointer text-sm text-blue-700">
+                                  View approved
+                                  course options
+                                </summary>
 
-              <p className="mt-3 leading-7 text-gray-600">
-                The next phase will combine these
-                requirements with official course
-                prerequisite information before
-                recommending future semesters.
-              </p>
-            </section>
+                                <p className="mt-2 max-w-3xl rounded-lg bg-blue-50 p-3 text-sm leading-6 text-blue-900">
+                                  {compactOptions(
+                                    course.choiceOptions
+                                  )}
+                                </p>
+                              </details>
+                            )}
+                          </div>
 
-            {/* Raw data debugging */}
+                          <span className="text-sm text-gray-500">
+                            {
+                              course.credits
+                            }{" "}
+                            credits
+                            {course
+                              .creditsEstimated
+                              ? " est."
+                              : ""}
+                          </span>
+                        </div>
+                      )
+                    )}
+                  </div>
+                </section>
+              )
+            )}
 
-            <details className="rounded-2xl border border-gray-200 bg-white p-6">
-              <summary className="cursor-pointer font-semibold">
-                View extracted DegreeWorks text
-              </summary>
+            {plan.unplaced.length >
+              0 && (
+              <section className="rounded-2xl border border-amber-200 bg-amber-50 p-7">
+                <h2 className="text-xl font-bold">
+                  Still Needs Placement
+                </h2>
 
-              <pre className="mt-5 max-h-96 overflow-auto whitespace-pre-wrap rounded-xl bg-gray-50 p-5 text-xs text-gray-600">
-                {result.rawText}
-              </pre>
-            </details>
+                <div className="mt-4 space-y-3">
+                  {plan.unplaced.map(
+                    (
+                      item,
+                      index
+                    ) => (
+                      <div
+                        key={
+                          index
+                        }
+                        className="rounded-xl bg-white p-4"
+                      >
+                        <p className="font-bold">
+                          {item.courseCode ??
+                            item.title}
+                        </p>
+
+                        <p className="mt-1 text-sm text-gray-600">
+                          {
+                            item.reason
+                          }
+                        </p>
+                      </div>
+                    )
+                  )}
+                </div>
+              </section>
+            )}
           </div>
         )}
       </div>
